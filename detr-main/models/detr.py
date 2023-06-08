@@ -36,7 +36,10 @@ class DETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+
+        # 可学习的query embedding 类似anchor
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
@@ -62,6 +65,7 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
+        # 因为hs包含了transformer的decoder各层的输出 因此-1指的是最后一层的输出
         hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
 
         outputs_class = self.class_embed(hs)
@@ -79,11 +83,14 @@ class DETR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
-
+# detr的loss标准
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
     The process happens in two steps:
+        首先是匹配算法
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
+        
+        其次是计算iou 从而选择正确的query_embedding进行反向传播更新 detr
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
@@ -101,21 +108,28 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
+        # 每个类的分类权重
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
+        # 是pytorch自带的 用于将一个Tensor注册为模型的缓存
+        # 这个缓存可以在模型的forward方法中使用，但不会被当做模型的参数进行优化。通常用于存储一些不需要优化的中间结果或者常量
         self.register_buffer('empty_weight', empty_weight)
-
+        
+        #分类loss 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
-
+        # 仅获取的是predict的index
         idx = self._get_src_permutation_idx(indices)
+
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        # 首先将所有的类别都设定位背景类别 90
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
+        # 获取的是target_classes 为原始打乱时的 反向来 
         target_classes[idx] = target_classes_o
 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
@@ -148,13 +162,14 @@ class SetCriterion(nn.Module):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
+        # 和上面的分类那里获取target_logit相同
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
+        # giou loss
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
@@ -192,6 +207,9 @@ class SetCriterion(nn.Module):
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
+        # 这里的batch_idx是获取query_embedding的index
+
+        # 运行结束完 是两行index
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
@@ -219,12 +237,15 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        # 过滤掉中间层的输出结果
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
+        # indices就是索引，返回的是一个batch中 query_embedding和gt的pair:[(index_predict, index_gt)]
         indices = self.matcher(outputs_without_aux, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
+        # 分布式节点同步
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
@@ -311,6 +332,7 @@ def build(args):
     # For more details on this, check the following discussion
     # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
     num_classes = 20 if args.dataset_file != 'coco' else 91
+    # 全景分割的coco
     if args.dataset_file == "coco_panoptic":
         # for panoptic, we just add a num_classes that is large enough to hold
         # max_obj_id + 1, but the exact value doesn't really matter
@@ -330,19 +352,25 @@ def build(args):
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
+
+    # 匈牙利匹配算法
     matcher = build_matcher(args)
+    # 这里是detr中不同loss的权重系数，例如回归损失(包括GIou loss和L1 loss)，分类损失 
     weight_dict = {'loss_ce': 1, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
     # TODO this is a hack
+
+    # 若设置了aux_loss 则代表需要计算解码器中间层预测结果对应的loss，这部分也要设定对应的权重
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
+    # cardinality是计算预测为前景的数量与GT数量的L1误差 仅用做展示 没有反向传播
     losses = ['labels', 'boxes', 'cardinality']
     if args.masks:
         losses += ["masks"]
